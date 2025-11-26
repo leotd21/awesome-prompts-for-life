@@ -138,11 +138,13 @@ class BatchLogManager:
         
         print(f"✓ Updated batch {batch_id} to status: {new_status}")
     
-    def get_non_terminal_batches(self, limit: Optional[int] = None) -> List[Dict]:
+    def get_non_terminal_batches(self, yearmonth: Optional[str] = None, 
+                                 limit: Optional[int] = None) -> List[Dict]:
         """
         Retrieve all batches with non-terminal statuses.
         
         Args:
+            yearmonth: Optional filter by yearmonth partition (format: YYYYMM)
             limit: Optional limit on number of records to return
             
         Returns:
@@ -154,8 +156,12 @@ class BatchLogManager:
             SELECT *
             FROM {self.full_table_name}
             WHERE batch_status IN ({status_filter})
-            ORDER BY created_at ASC
         """
+        
+        if yearmonth:
+            query += f" AND yearmonth = '{yearmonth}'"
+        
+        query += " ORDER BY created_at ASC"
         
         if limit:
             query += f" LIMIT {limit}"
@@ -224,13 +230,18 @@ class BatchLogManager:
         
         return batch['retry_count'] < batch['max_retries']
     
-    def get_statistics(self) -> Dict:
+    def get_statistics(self, yearmonth: Optional[str] = None) -> Dict:
         """
         Get overall statistics of batch processing.
+        
+        Args:
+            yearmonth: Optional filter by yearmonth partition (format: YYYYMM)
         
         Returns:
             Dictionary with status counts and metrics
         """
+        where_clause = f"WHERE yearmonth = '{yearmonth}'" if yearmonth else ""
+        
         stats_df = self.spark.sql(f"""
             SELECT 
                 batch_status,
@@ -240,6 +251,7 @@ class BatchLogManager:
                 SUM(failed_prompts) as failed_prompts,
                 AVG(retry_count) as avg_retry_count
             FROM {self.full_table_name}
+            {where_clause}
             GROUP BY batch_status
             ORDER BY batch_status
         """)
@@ -247,40 +259,47 @@ class BatchLogManager:
         return {row['batch_status']: row.asDict() 
                 for row in stats_df.collect()}
     
-    def get_stuck_batches(self, hours_threshold: int = 24) -> List[Dict]:
+    def get_stuck_batches(self, hours_threshold: int = 24, 
+                         yearmonth: Optional[str] = None) -> List[Dict]:
         """
         Find batches that have been in non-terminal status for too long.
         
         Args:
             hours_threshold: Number of hours to consider a batch as stuck
+            yearmonth: Optional filter by yearmonth partition (format: YYYYMM)
             
         Returns:
             List of potentially stuck batch records
         """
         status_filter = ", ".join([f"'{s}'" for s in self.NON_TERMINAL_STATUSES])
         
+        yearmonth_clause = f"AND yearmonth = '{yearmonth}'" if yearmonth else ""
+        
         query = f"""
             SELECT *
             FROM {self.full_table_name}
             WHERE batch_status IN ({status_filter})
               AND updated_at < date_sub(current_timestamp(), {hours_threshold}/24)
+              {yearmonth_clause}
             ORDER BY updated_at ASC
         """
         
         df = self.spark.sql(query)
         return [row.asDict() for row in df.collect()]
     
-    def mark_stuck_batches_as_failed(self, hours_threshold: int = 24) -> int:
+    def mark_stuck_batches_as_failed(self, hours_threshold: int = 24,
+                                    yearmonth: Optional[str] = None) -> int:
         """
         Mark stuck batches as FAILED.
         
         Args:
             hours_threshold: Number of hours to consider a batch as stuck
+            yearmonth: Optional filter by yearmonth partition (format: YYYYMM)
             
         Returns:
             Number of batches marked as failed
         """
-        stuck_batches = self.get_stuck_batches(hours_threshold)
+        stuck_batches = self.get_stuck_batches(hours_threshold, yearmonth)
         
         for batch in stuck_batches:
             self.update_batch_status(
@@ -291,7 +310,32 @@ class BatchLogManager:
         
         return len(stuck_batches)
     
-    def cleanup_old_records(self, days_to_keep: int = 90) -> int:
+    @staticmethod
+    def get_current_yearmonth() -> str:
+        """
+        Get current yearmonth in YYYYMM format.
+        
+        Returns:
+            Current yearmonth string (e.g., '202411')
+        """
+        return datetime.now(timezone.utc).strftime('%Y%m')
+    
+    @staticmethod
+    def parse_yearmonth(year: int, month: int) -> str:
+        """
+        Create yearmonth string from year and month.
+        
+        Args:
+            year: Year (e.g., 2024)
+            month: Month (1-12)
+            
+        Returns:
+            Yearmonth string (e.g., '202411')
+        """
+        return f"{year}{month:02d}"
+    
+    def cleanup_old_records(self, days_to_keep: int = 90,
+                           yearmonth: Optional[str] = None) -> int:
         """
         Delete old completed batch records.
         
